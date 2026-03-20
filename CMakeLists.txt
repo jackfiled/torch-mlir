@@ -208,6 +208,7 @@ if(MLIR_ENABLE_BINDINGS_PYTHON)
   endif()
 endif()
 
+add_subdirectory(unittests)
 add_subdirectory(test)
 
 if (NOT LLVM_INSTALL_TOOLCHAIN_ONLY)

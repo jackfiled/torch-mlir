@@ -43,6 +43,7 @@ def Torch_Dialect : Dialect {
     Type parseType(DialectAsmParser &parser) const override;
     /// Print a type registered to this dialect.
     void printType(Type type, DialectAsmPrinter &printer) const override;
+    void registerAttributes();
   }];
 }
 

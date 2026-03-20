@@ -15,6 +15,7 @@
 #include "mlir/Transforms/InliningUtils.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchTypes.h"
+#include "torch-mlir/Dialect/Torch/IR/TorchAttributes.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -108,6 +109,8 @@ void TorchDialect::initialize() {
 
       >();
   addInterfaces<TorchInlinerInterface>();
+
+  registerAttributes();
 }
 
 //===----------------------------------------------------------------------===//

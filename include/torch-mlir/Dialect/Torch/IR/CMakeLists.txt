@@ -11,5 +11,10 @@ mlir_tablegen(TorchTypes.h.inc -gen-typedef-decls)
 mlir_tablegen(TorchTypes.cpp.inc -gen-typedef-defs)
 add_public_tablegen_target(MLIRTorchTypesIncGen)
 
+set(LLVM_TARGET_DEFINITIONS TorchAttributes.td)
+mlir_tablegen(TorchAttributes.h.inc -gen-attrdef-decls)
+mlir_tablegen(TorchAttributes.cpp.inc -gen-attrdef-defs)
+add_public_tablegen_target(MLIRTorchAttributesIncGen)
+
 add_mlir_doc(TorchDialect TorchDialect Torch/ -gen-dialect-doc)
 add_mlir_doc(TorchOps TorchOps Torch/ -gen-op-doc)
