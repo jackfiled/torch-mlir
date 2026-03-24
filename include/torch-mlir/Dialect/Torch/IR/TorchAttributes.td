@@ -37,10 +37,20 @@ def Torch_DenseExternalElementsAttr : TorchDialect_Attr<"DenseExternalElements",
   let extraClassDeclaration = [{
     static bool isSplat();
 
-    ::mlir::FailureOr<::mlir::detail::ElementsAttrIndexer> getValuesImpl(::mlir::TypeID);
+    using ContiguousIterableTypesT = std::tuple<float, double>;
 
     template <typename T>
-    static ::mlir::FailureOr<::mlir::torch::Torch::BufferFileInfo> appendBufferToFile(::llvm::StringRef, ::llvm::ArrayRef<T>);
+    static DenseExternalElementsAttr get(::mlir::MLIRContext *, ::mlir::ShapedType, ::llvm::StringRef, ::llvm::ArrayRef<T>);
+
+    template <typename T>
+    ::mlir::FailureOr<const T *> try_value_begin_impl(OverloadToken<T>) const;
+
+  private:
+    ::mlir::FailureOr<::llvm::ArrayRef<char>> loadBuffer() const;
+
+    static ::mlir::FailureOr<int64_t> appendBufferIntoFile(::llvm::StringRef, const char *, int64_t);
+
+  public:
   }];
 
 }

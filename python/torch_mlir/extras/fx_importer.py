@@ -135,7 +135,7 @@ from ..ir import (
 from ..dialects import (
     func as func_dialect,
 )
-
+from ..dialects.torch import DenseExternalElementsAttr
 
 __all__ = [
     "FxImporter",
@@ -539,6 +539,7 @@ class FxImporter:
         "symbol_table",
         "_graph_module_to_func_name",
         "_func_name_counter",
+        "_external_data_filename"
     ]
 
     def __init__(
@@ -883,6 +884,7 @@ class FxImporter:
         func_name: str = "main",
         func_visibility: Optional[str] = None,
         import_symbolic_shape_expressions: bool = False,
+        external_data_filename: str | None = None,
     ) -> Operation:
         """Imports a consolidated torch.export.ExportedProgram instance.
 
@@ -920,6 +922,9 @@ class FxImporter:
         # Populate symbolic guards for dynamic shapes (if any)
         if import_symbolic_shape_expressions:
             self._cc.set_symbolic_guards(prog)
+
+        # Export data into external file.
+        self._external_data_filename = external_data_filename
 
         # If there is no "constants" attribute, consult the "state_dict". Otherwise, only look
         # at "constants". Relevant upstream patch: https://github.com/pytorch/pytorch/pull/118969
@@ -2499,7 +2504,7 @@ def create_mlir_tensor_type(tensor: torch.Tensor) -> IrType:
 
 
 def _make_vtensor_literal_op(
-    tensor: torch.Tensor, vtensor_type: IrType, py_attr_tracker: "RefTracker"
+    tensor: torch.Tensor, vtensor_type: IrType, py_attr_tracker: "RefTracker", external_data_filename: str | None = None
 ) -> Operation:
     mapping = py_attr_tracker.track(tensor)
     if mapping.is_empty:
@@ -2534,13 +2539,16 @@ def _make_vtensor_literal_op(
         else:
             bytes_view = np_tensor.view(npy_dtype)
             tensor_type = create_mlir_tensor_type(tensor)
-            shape_desc = "_".join([str(d) for d in tensor.shape])
-            blob_name = f"torch_tensor_{shape_desc}_{str(tensor.dtype)}"
-            elements_attr = DenseResourceElementsAttr.get_from_buffer(
-                bytes_view,
-                blob_name,
-                tensor_type,
-            )
+            if external_data_filename is not None:
+                elements_attr = DenseExternalElementsAttr.get(bytes_view, external_data_filename, tensor_type)
+            else:
+                shape_desc = "_".join([str(d) for d in tensor.shape])
+                blob_name = f"torch_tensor_{shape_desc}_{str(tensor.dtype)}"
+                elements_attr = DenseResourceElementsAttr.get_from_buffer(
+                    bytes_view,
+                    blob_name,
+                    tensor_type,
+                )
         mapping.value = elements_attr
     else:
         elements_attr = mapping.value
@@ -2729,7 +2737,7 @@ LITERAL_CONVERTER_MAP.map(
 LITERAL_CONVERTER_MAP.map(
     torch.Tensor,
     lambda arg, gni, cc: _make_vtensor_literal_op(
-        arg, cc.tensor_to_vtensor_type(arg), cc._py_attr_tracker
+        arg, cc.tensor_to_vtensor_type(arg), cc._py_attr_tracker, gni.fx_importer._external_data_filename
     ).result,
 )
 LITERAL_CONVERTER_MAP.map(

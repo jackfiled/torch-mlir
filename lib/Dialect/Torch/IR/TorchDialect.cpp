@@ -9,13 +9,12 @@
 
 #include "torch-mlir/Dialect/Torch/IR/TorchDialect.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Transforms/InliningUtils.h"
+#include "torch-mlir/Dialect/Torch/IR/TorchAttributes.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchTypes.h"
-#include "torch-mlir/Dialect/Torch/IR/TorchAttributes.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -91,6 +90,20 @@ Type TorchDialect::parseType(DialectAsmParser &parser) const {
 /// Print a type registered to this dialect.
 void TorchDialect::printType(Type type, DialectAsmPrinter &printer) const {
   printTorchDialectType(type, printer);
+}
+
+//===----------------------------------------------------------------------===//
+// Torch dialect parseAttribute/printAttribute methods.
+//===----------------------------------------------------------------------===//
+
+Attribute TorchDialect::parseAttribute(DialectAsmParser &parser,
+                                       Type type) const {
+  return parseTorchDialectAttributes(parser, type);
+}
+
+void TorchDialect::printAttribute(Attribute attr,
+                                  DialectAsmPrinter &printer) const {
+  printTorchDialectAttributes(attr, printer);
 }
 
 //===----------------------------------------------------------------------===//

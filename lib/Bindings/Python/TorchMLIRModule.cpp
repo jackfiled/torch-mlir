@@ -15,6 +15,10 @@
 
 namespace nb = nanobind;
 
+namespace mlir::python::torch::Torch {
+void populateTorchAttributes(nb::module_ &m);
+}
+
 NB_MODULE(_torchMlir, m) {
   torchMlirRegisterAllPasses();
 
@@ -34,4 +38,6 @@ NB_MODULE(_torchMlir, m) {
   m.def("get_int64_max", []() { return INT64_MAX; });
 
   m.def("get_int64_min", []() { return INT64_MIN; });
+
+  mlir::python::torch::Torch::populateTorchAttributes(m);
 }

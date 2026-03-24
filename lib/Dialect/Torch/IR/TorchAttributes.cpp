@@ -43,7 +43,23 @@ FailureOr<std::vector<char>> readArray(const StringRef filename,
   return result;
 }
 
+template <typename T> struct DenseExternalAttributeUtil;
+
+template <> struct DenseExternalAttributeUtil<float> {
+  static bool checkElementType(const Type &elementType) {
+    return elementType.isF32();
+  }
+};
+
+template <> struct DenseExternalAttributeUtil<double> {
+  static bool checkElementType(const Type &elementType) {
+    return elementType.isF64();
+  }
+};
 } // namespace
+
+#define GET_ATTRDEF_CLASSES
+#include "torch-mlir/Dialect/Torch/IR/TorchAttributes.cpp.inc"
 
 namespace mlir::torch::Torch {
 namespace detail {
@@ -56,10 +72,9 @@ struct DenseExternalElementsAttrStorage : AttributeStorage {
   KeyTy getAsKey() const { return KeyTy{type, filename, offset, length}; }
 
   bool operator==(const KeyTy &tblgenKey) const {
-    return (type == std::get<0>(tblgenKey)) &&
-           (filename == std::get<1>(tblgenKey)) &&
-           (offset == std::get<2>(tblgenKey)) &&
-           (length == std::get<3>(tblgenKey));
+    return type == llvm::cast<Type>(std::get<0>(tblgenKey)) &&
+           filename == std::get<1>(tblgenKey) &&
+           offset == std::get<2>(tblgenKey) && length == std::get<3>(tblgenKey);
   }
 
   static hash_code hashKey(const KeyTy &tblgenKey) {
@@ -88,27 +103,6 @@ struct DenseExternalElementsAttrStorage : AttributeStorage {
 
 bool DenseExternalElementsAttr::isSplat() { return false; }
 
-FailureOr<mlir::detail::ElementsAttrIndexer>
-DenseExternalElementsAttr::getValuesImpl(TypeID elementID) {
-  if (auto elementType = getElementType();
-      elementType.getTypeID() != elementID) {
-    return failure();
-  }
-
-  if (!getImpl()->buffer.has_value()) {
-    auto buffer = readArray(getFilename(), getOffset(), getLength());
-
-    if (failed(buffer)) {
-      return failure();
-    }
-
-    getImpl()->buffer = std::move(buffer);
-  }
-
-  return mlir::detail::ElementsAttrIndexer::contiguous<char>(
-      false, getImpl()->buffer->data());
-}
-
 ShapedType DenseExternalElementsAttr::getType() const {
   return getImpl()->type;
 }
@@ -125,6 +119,48 @@ int64_t DenseExternalElementsAttr::getLength() const {
   return getImpl()->length;
 }
 
+FailureOr<ArrayRef<char>> DenseExternalElementsAttr::loadBuffer() const {
+  if (getImpl()->buffer) {
+    return ArrayRef<char>{getImpl()->buffer.value()};
+  }
+
+  auto buffer = readArray(getFilename(), getOffset(), getLength());
+
+  if (failed(buffer)) {
+    return failure();
+  }
+
+  getImpl()->buffer = std::move(buffer);
+  return ArrayRef<char>{getImpl()->buffer.value()};
+}
+
+FailureOr<int64_t> DenseExternalElementsAttr::appendBufferIntoFile(
+    StringRef filename, const char *data, int64_t length) {
+  std::fstream file{filename.data(), std::ios::binary | std::ios::in |
+                                         std::ios::out | std::ios::ate};
+  if (!file.is_open()) {
+    // If file not existed
+    file.open(filename.data(),
+              std::ios::binary | std::ios::out | std::ios::trunc);
+
+    if (!file.is_open()) {
+      LLVM_DEBUG(llvm::dbgs() << "Failed to create file: " << filename);
+      return failure();
+    }
+  }
+
+  const int64_t offset = file.tellp();
+
+  file.write(data, length);
+  if (!file) {
+    LLVM_DEBUG(llvm::dbgs() << "failed to write into file: " << filename);
+    return failure();
+  }
+
+  file.flush();
+  return offset;
+}
+
 void TorchDialect::registerAttributes() {
   addAttributes<
 #define GET_ATTRDEF_LIST
@@ -132,7 +168,27 @@ void TorchDialect::registerAttributes() {
 
       >();
 }
-} // namespace mlir::torch::Torch
 
-#define GET_ATTRDEF_CLASSES
-#include "torch-mlir/Dialect/Torch/IR/TorchAttributes.cpp.inc"
+Attribute parseTorchDialectAttributes(AsmParser &parser, Type type) {
+  const auto currentLocation = parser.getCurrentLocation();
+
+  StringRef mnemonic;
+  Attribute result;
+  auto parsedResult = generatedAttributeParser(parser, &mnemonic, type, result);
+  if (parsedResult.has_value()) {
+    return result;
+  }
+
+  parser.emitError(currentLocation)
+      << "Failed to parse attribute '" << mnemonic << "' in dialect '"
+      << TorchDialect::getDialectNamespace() << "'";
+  return {};
+}
+
+void printTorchDialectAttributes(Attribute attr, AsmPrinter &printer) {
+  if (failed(generatedAttributePrinter(attr, printer))) {
+    LLVM_DEBUG(dbgs() << "Failed to print attributes of torch dialect.");
+  }
+}
+
+} // namespace mlir::torch::Torch
