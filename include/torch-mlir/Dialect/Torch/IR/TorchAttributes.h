@@ -1,8 +1,6 @@
 #ifndef TORCH_MLIR_TORCHATTRIBUTES_H
 #define TORCH_MLIR_TORCHATTRIBUTES_H
 
-#define DEBUG_TYPE "torch-mlir-torch-attributes"
-
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/BuiltinAttributeInterfaces.h"
 
