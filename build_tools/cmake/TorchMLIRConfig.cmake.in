@@ -1,0 +1,9 @@
+# This file allows users to call find_package(TorchMLIR) and pick up our targets.
+
+@MLIR_CONFIG_CODE@
+
+set(TORCH_MLIR_EXPORTED_TARGETS "@TORCH_MLIR_EXPORTS@")
+set(TORCH_MLIR_INCLUDE_DIRS "@TORCH_MLIR_CONFIG_INCLUDE_DIRS@")
+
+# Provide all our library targets to users.
+@TORCH_MLIR_CONFIG_INCLUDE_EXPORTS@

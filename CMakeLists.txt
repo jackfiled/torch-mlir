@@ -278,3 +278,30 @@ add_subdirectory(projects)
 if(MLIR_ENABLE_BINDINGS_PYTHON)
   add_subdirectory(python)
 endif()
+
+#-------------------------------------------------------------------------------
+# Generate `<build>/lib/cmake/torch-mlir/TorchMLIRConfig.cmake
+#-------------------------------------------------------------------------------
+
+set(torch_mlir_cmake_builddir ${CMAKE_CURRENT_BINARY_DIR}/lib/cmake/torch-mlir)
+
+get_property(TORCH_MLIR_EXPORTS GLOBAL PROPERTY MLIR_EXPORTS)
+export(TARGETS ${TORCH_MLIR_EXPORTS} FILE ${torch_mlir_cmake_builddir}/TorchMLIRTargets.cmake)
+
+set(TORCH_MLIR_CONFIG_INCLUDE_EXPORTS "include(\"\${CMAKE_CURRENT_LIST_DIR}/TorchMLIRTargets.cmake\")")
+set(TORCH_MLIR_CONFIG_INCLUDE_DIRS
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${CMAKE_CURRENT_BINARY_DIR}/include"
+)
+set(PACKAGE_VERSION 0.1.0)
+
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/build_tools/cmake/TorchMLIRConfig.cmake.in
+  ${torch_mlir_cmake_builddir}/TorchMLIRConfig.cmake
+  @ONLY
+)
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/build_tools/cmake/TorchMLIRConfigVersion.cmake.in
+  ${torch_mlir_cmake_builddir}/TorchMLIRConfigVersion.cmake
+  @ONLY
+)
