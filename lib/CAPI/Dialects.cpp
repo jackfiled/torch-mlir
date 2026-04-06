@@ -11,6 +11,9 @@
 
 #include "mlir/CAPI/Registration.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchDialect.h"
+#include "torch-mlir-dialects/Dialect/TMTensor/IR/TMTensorDialect.h"
+
 
 MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(Torch, torch,
                                       mlir::torch::Torch::TorchDialect)
+MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(TMTensor, tmtensor, mlir::torch::TMTensor::TMTensorDialect)

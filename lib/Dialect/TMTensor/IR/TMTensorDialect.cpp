@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "torch-mlir-dialects/Dialect/TMTensor/IR/TMTensorDialect.h"
+#include "torch-mlir-dialects/Dialect/TMTensor/IR/TMTensorAttributes.h"
 #include "torch-mlir-dialects/Dialect/TMTensor/IR/TMTensorOps.h"
 
 #include "mlir/IR/Attributes.h"
@@ -25,6 +26,18 @@ void TMTensorDialect::initialize() {
   addOperations<
 #include "torch-mlir-dialects/Dialect/TMTensor/IR/TMTensorOps.cpp.inc"
       >();
+
+  registerAttributes();
+}
+
+Attribute TMTensorDialect::parseAttribute(DialectAsmParser &parser,
+                                          Type type) const {
+  return parseTMTensorDialectAttributes(parser, type);
+}
+
+void TMTensorDialect::printAttribute(Attribute attr,
+                                     DialectAsmPrinter &printer) const {
+  printTMTensorDialectAttributes(attr, printer);
 }
 
 #include "torch-mlir-dialects/Dialect/TMTensor/IR/TMTensorDialect.cpp.inc"

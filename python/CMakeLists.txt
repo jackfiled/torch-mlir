@@ -6,6 +6,7 @@ set(CMAKE_PLATFORM_NO_VERSIONED_SONAME ON)
 # See documentation for `declare_mlir_python_sources`'s ROOT_DIR
 # argument.
 set(TORCH_MLIR_PYTHON_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/torch_mlir")
+set(TORCH_MLIR_PYTHON_SOURCE_DIR "${CMAKE_SOURCE_DIR}/lib/Bindings/Python")
 
 
 # We vendor our own MLIR instance in the `torch_mlir` namespace.
@@ -29,6 +30,13 @@ declare_mlir_dialect_python_bindings(
   TD_FILE dialects/TorchBinding.td
   SOURCES dialects/torch/__init__.py
   DIALECT_NAME torch
+)
+
+declare_mlir_dialect_python_bindings(
+  ADD_TO_PARENT TorchMLIRPythonSources.Dialects
+  ROOT_DIR "${TORCH_MLIR_PYTHON_ROOT_DIR}"
+  SOURCES dialects/tmtensor/__init__.py
+  DIALECT_NAME tmtensor
 )
 
 declare_mlir_python_sources(TorchMLIRPythonSources.Importers
@@ -70,12 +78,22 @@ declare_mlir_python_sources(TorchMLIRSiteInitialize
 declare_mlir_python_extension(TorchMLIRPythonExtensions.Main
   MODULE_NAME _torchMlir
   ADD_TO_PARENT TorchMLIRPythonExtensions
+  ROOT_DIR "${TORCH_MLIR_PYTHON_SOURCE_DIR}"
   SOURCES
     TorchMLIRModule.cpp
   EMBED_CAPI_LINK_LIBS
     TorchMLIRCAPI
   PRIVATE_LINK_LIBS
     LLVMSupport
+)
+
+declare_mlir_python_extension(TorchMLIRPythonExtensions.Support
+  _PRIVATE_SUPPORT_LIB
+  MODULE_NAME Support
+  ADD_TO_PARENT TorchMLIRPythonExtensions
+  ROOT_DIR "${TORCH_MLIR_PYTHON_SOURCE_DIR}"
+  SOURCES
+    DialectTMTensor.cpp
 )
 
 ################################################################################

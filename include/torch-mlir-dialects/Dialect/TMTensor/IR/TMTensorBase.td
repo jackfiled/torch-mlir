@@ -43,6 +43,12 @@ def TMTensor_Dialect : Dialect {
     to.
   }];
   let hasCanonicalizer = 1;
+
+  let extraClassDeclaration = [{
+    Attribute parseAttribute(DialectAsmParser &parser, Type type) const override;
+    void printAttribute(Attribute, DialectAsmPrinter &) const override;
+    void registerAttributes();
+  }];
 }
 
 //===----------------------------------------------------------------------===//

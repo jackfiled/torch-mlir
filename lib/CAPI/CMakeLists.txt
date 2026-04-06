@@ -4,6 +4,7 @@ add_mlir_public_c_api_library(TorchMLIRCAPI
   TorchOps.cpp
   TorchTypes.cpp
   Transforms.cpp
+  TMTensorAttributes.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/torch-mlir-c/

@@ -18,6 +18,8 @@ extern "C" {
 
 MLIR_DECLARE_CAPI_DIALECT_REGISTRATION(Torch, torch);
 
+MLIR_DECLARE_CAPI_DIALECT_REGISTRATION(TMTensor, tmtensor);
+
 #ifdef __cplusplus
 }
 #endif

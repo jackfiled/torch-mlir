@@ -3,6 +3,7 @@ add_mlir_library(TorchMLIRTMTensorDialect
   TMTensorInterfaces.cpp
   TMTensorOps.cpp
   ScalarLoopOpInterface.cpp
+  TMTensorAttributes.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${TORCH_MLIR_DIALECTS_SOURCE_DIR}/include

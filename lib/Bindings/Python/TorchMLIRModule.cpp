@@ -15,6 +15,10 @@
 
 namespace nb = nanobind;
 
+namespace mlir::python::torch::TMTensor {
+void populateTMTensorAttributes(nb::module_ &m);
+}
+
 NB_MODULE(_torchMlir, m) {
   torchMlirRegisterAllPasses();
 
@@ -23,10 +27,21 @@ NB_MODULE(_torchMlir, m) {
   m.def(
       "register_dialect",
       [](MlirContext context, bool load) {
-        MlirDialectHandle handle = mlirGetDialectHandle__torch__();
-        mlirDialectHandleRegisterDialect(handle, context);
+        MlirDialectHandle torchHandler = mlirGetDialectHandle__torch__();
+        mlirDialectHandleRegisterDialect(torchHandler, context);
         if (load) {
-          mlirDialectHandleLoadDialect(handle, context);
+          mlirDialectHandleLoadDialect(torchHandler, context);
+        }
+      },
+      nb::arg("context"), nb::arg("load") = true);
+
+  m.def(
+      "register_tmtensor_dialect",
+      [](MlirContext context, bool load) {
+        MlirDialectHandle tmTensorHandler = mlirGetDialectHandle__tmtensor__();
+        mlirDialectHandleRegisterDialect(tmTensorHandler, context);
+        if (load) {
+          mlirDialectHandleLoadDialect(tmTensorHandler, context);
         }
       },
       nb::arg("context"), nb::arg("load") = true);
@@ -34,4 +49,6 @@ NB_MODULE(_torchMlir, m) {
   m.def("get_int64_max", []() { return INT64_MAX; });
 
   m.def("get_int64_min", []() { return INT64_MIN; });
+
+  mlir::python::torch::TMTensor::populateTMTensorAttributes(m);
 }

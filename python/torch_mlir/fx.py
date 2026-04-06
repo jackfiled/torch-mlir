@@ -17,6 +17,7 @@ from torch.export import ExportedProgram
 from .extras.fx_importer import FxImporter, FxImporterHooks
 from . import ir
 from .dialects import torch as torch_d
+from .dialects import tmtensor as torch_tensor_d
 from .extras.fx_decomp_util import get_decomposition_table
 from .compiler_utils import (
     OutputType,
@@ -103,10 +104,12 @@ def export_and_import(
     enable_ir_printing: bool = False,
     backend_legal_ops: Optional[list[str]] = None,
     allow_non_finites: bool = True,
+    external_data_filename: str | None = None,
     **kwargs,
 ):
     context = ir.Context()
     torch_d.register_dialect(context)
+    torch_tensor_d.register_dialect(context)
 
     if fx_importer is None:
         fx_importer = FxImporter(context=context, hooks=hooks)
@@ -139,6 +142,7 @@ def export_and_import(
             prog,
             func_name=func_name,
             import_symbolic_shape_expressions=import_symbolic_shape_expressions,
+            external_data_filename=external_data_filename
         )
 
     fx_import_options = FxImportOptions(backend_legal_ops=backend_legal_ops)
@@ -170,6 +174,7 @@ def stateless_fx_import(
         gm.print_readable()
     context = ir.Context()
     torch_d.register_dialect(context)
+    torch_tensor_d.register_dialect(context)
     if fx_importer is None:
         fx_importer = FxImporter(context=context, hooks=hooks)
     fx_importer.import_stateless_graph(gm.graph, func_name=model_name)
