@@ -110,6 +110,26 @@ Value getTosaConstTensorSingleF32(PatternRewriter &rewriter, Operation *op,
   return const_op.getResult();
 }
 
+FailureOr<Value> getBroadcastableConstTensorSingleF32(PatternRewriter &rewriter,
+                                                      Operation *op, Value like,
+                                                      float val) {
+  auto likeTy = dyn_cast<RankedTensorType>(like.getType());
+  if (!likeTy || !isa<FloatType>(likeTy.getElementType()))
+    return failure();
+
+  Value constant = getTosaConstTensorSingleF32(rewriter, op, val);
+  if (!likeTy.getElementType().isF32()) {
+    auto castedConstant = tosa::tosaCastTensorToType(
+        rewriter, constant, RankedTensorType::get({}, likeTy.getElementType()));
+    if (!castedConstant)
+      return failure();
+    constant = *castedConstant;
+  }
+  if (failed(mlir::tosa::EqualizeRanks(rewriter, op->getLoc(), like, constant)))
+    return failure();
+  return constant;
+}
+
 // Create an int8_t const tosa.mul shift tensor from an int
 Value getTosaMulShiftConstTensor(PatternRewriter &rewriter, Operation *op,
                                  int32_t shift) {
@@ -491,8 +511,7 @@ LogicalResult getConvOpsAccType(PatternRewriter &rewriter,
              (weightElemTy.isInteger(8) || weightElemTy.isInteger(4)) &&
              outputElemTy.isInteger(32)) {
     accType = mlir::TypeAttr::get(rewriter.getIntegerType(32));
-  } else if (inputElemTy.isInteger(16) && weightElemTy.isInteger(8) &&
-             outputElemTy.isInteger(48)) {
+  } else if (inputElemTy.isInteger(16)) {
     accType = mlir::TypeAttr::get(rewriter.getIntegerType(48));
   } else if ((isa<Float8E4M3Type>(inputElemTy) &&
               isa<Float8E4M3Type>(weightElemTy) && outputElemTy.isF16()) ||
@@ -652,10 +671,13 @@ void computeResizeParams(int inputSize, int outputSize, bool alignCorners,
   scaleN = 2 * scaleN / gcd;
   scaleD = 2 * scaleD / gcd;
 
-  // If nearest neighbors we need to guarantee we round up.
   offset = 0;
-  if (mode == tosa::ResizeMode::NEAREST_NEIGHBOR && alignCorners) {
-    offset += scaleN / 2;
+  if (mode == tosa::ResizeMode::BILINEAR && !applyAligned) {
+    // Set offset to match PyTorch half-pixel centers
+    offset = (scaleD - scaleN) / 2;
+  } else if (mode == tosa::ResizeMode::NEAREST_NEIGHBOR && alignCorners) {
+    // If nearest neighbors we need to guarantee we round up.
+    offset = scaleN / 2;
   }
 
   // We can compute this directly based on previous values.

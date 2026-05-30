@@ -22,6 +22,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/MathExtras.h"
 #include <cstdint>
 #include <set>
 using namespace mlir;
@@ -1366,8 +1367,8 @@ public:
       self = convertTensorToDtype(rewriter, loc, self, outTy.getDtype());
     }
 
-    Value pi =
-        ConstantFloatOp::create(rewriter, loc, rewriter.getF64FloatAttr(M_PI));
+    Value pi = ConstantFloatOp::create(
+        rewriter, loc, rewriter.getF64FloatAttr(llvm::numbers::pi));
     Value basic =
         ConstantFloatOp::create(rewriter, loc, rewriter.getF64FloatAttr(180.0));
     Value rad =
@@ -3253,8 +3254,8 @@ public:
 
     Value constantOne =
         ConstantIntOp::create(rewriter, loc, rewriter.getI64IntegerAttr(1));
-    Value expSelf = AtenExpOp::create(rewriter, loc, outTy, self);
-    Value expOther = AtenExpOp::create(rewriter, loc, outTy, other);
+    Value expSelf = AtenExpOp::create(rewriter, loc, self.getType(), self);
+    Value expOther = AtenExpOp::create(rewriter, loc, other.getType(), other);
     Value addValue = AtenAddTensorOp::create(rewriter, loc, outTy, expSelf,
                                              expOther, constantOne);
     rewriter.replaceOpWithNewOp<AtenLogOp>(op, outTy, addValue);
@@ -3276,8 +3277,8 @@ public:
 
     Value constantOne =
         ConstantIntOp::create(rewriter, loc, rewriter.getI64IntegerAttr(1));
-    Value expSelf = AtenExp2Op::create(rewriter, loc, outTy, self);
-    Value expOther = AtenExp2Op::create(rewriter, loc, outTy, other);
+    Value expSelf = AtenExp2Op::create(rewriter, loc, self.getType(), self);
+    Value expOther = AtenExp2Op::create(rewriter, loc, other.getType(), other);
     Value addValue = AtenAddTensorOp::create(rewriter, loc, outTy, expSelf,
                                              expOther, constantOne);
     rewriter.replaceOpWithNewOp<AtenLog2Op>(op, outTy, addValue);
@@ -5095,6 +5096,17 @@ public:
       repeatInts.push_back(repeat);
     }
 
+    // Track repeated singleton dims that can be materialized with broadcast.
+    llvm::SmallVector<int64_t> selfSizes(selfTy.getSizes().begin(),
+                                         selfTy.getSizes().end());
+    llvm::SmallVector<bool> broadcastRepeatedSingletonDims(repeats.size(),
+                                                           false);
+    for (int i = batch, s = repeats.size(); i < s; ++i) {
+      int64_t inputDim = i - batch;
+      broadcastRepeatedSingletonDims[i] =
+          selfSizes[inputDim] == 1 && repeatInts[i] > 1;
+    }
+
     // Unsqueeze all newly created dims
     llvm::SmallVector<int> unsqueezeDims;
     for (int i = 0; i < batch; ++i) {
@@ -5105,9 +5117,9 @@ public:
       unsqueezeDims.push_back(i);
     }
 
-    // Unsqueeze any non-unary repeats for existing dims
+    // Unsqueeze non-unary repeats, except singleton dims handled by broadcast.
     for (int i = batch, s = repeats.size(); i < s; ++i) {
-      if (repeatInts[i] == 1)
+      if (repeatInts[i] == 1 || broadcastRepeatedSingletonDims[i])
         continue;
       int64_t dim = i + unsqueezeDims.size() - batch;
       Value iv =
@@ -5126,6 +5138,12 @@ public:
     }
 
     for (int i = batch, s = repeats.size(); i < s; ++i) {
+      if (broadcastRepeatedSingletonDims[i]) {
+        lengths.push_back(repeats[i]);
+        expandShape.push_back(repeatInts[i]);
+        continue;
+      }
+
       if (repeatInts[i] != 1) {
         lengths.push_back(repeats[i]);
         expandShape.push_back(repeatInts[i]);
@@ -5148,7 +5166,7 @@ public:
 
     auto outShape = cast<ValueTensorType>(op.getResult().getType()).getSizes();
     for (int i = batch, s = repeats.size(); i < s; ++i) {
-      if (repeatInts[i] == 1)
+      if (repeatInts[i] == 1 || broadcastRepeatedSingletonDims[i])
         continue;
 
       auto selfShape = selfTy.getSizes();
@@ -7855,9 +7873,28 @@ class DecomposeAtenInstanceNormOp
           rewriter, loc, rewriter.getI64IntegerAttr(i)));
     }
 
-    Type dtype = inputTy.getOptionalDtype();
-    Type reducedTy = ValueTensorType::get(op.getContext(),
-                                          llvm::ArrayRef(reducedShape), dtype);
+    Type origDtype = inputTy.getOptionalDtype();
+    Type accDtype = getDefaultAccType(rewriter, origDtype);
+    auto sizesOpt = std::optional<ArrayRef<int64_t>>(inputTy.getSizes());
+    Type inputAccTy = inputTy.getWithSizesAndDtype(sizesOpt, accDtype);
+    Type reducedAccTy =
+        ValueTensorType::get(context, llvm::ArrayRef(reducedShape), accDtype);
+
+    // Upcast all operands to the accumulator dtype; downcast once at the end.
+    Value input = op.getInput();
+    Value weight = op.getWeight();
+    Value bias = op.getBias();
+    auto convertOperandToAcc = [&](Value v) -> Value {
+      if (isa<Torch::NoneType>(v.getType()))
+        return v;
+      auto tensorTy = cast<BaseTensorType>(v.getType());
+      if (tensorTy.getOptionalDtype() == accDtype)
+        return v;
+      return convertTensorToDtype(rewriter, loc, v, accDtype);
+    };
+    input = convertOperandToAcc(input);
+    weight = convertOperandToAcc(weight);
+    bias = convertOperandToAcc(bias);
 
     auto sizeListType = ListType::get(IntType::get(context));
     Value reduceDimList =
@@ -7869,20 +7906,20 @@ class DecomposeAtenInstanceNormOp
                                              rewriter.getI64IntegerAttr(1));
 
     // mean(x)
-    Value inputMean = AtenMeanDimOp::create(
-        rewriter, loc, reducedTy, op.getInput(), reduceDimList, cstTrue, none);
+    Value inputMean = AtenMeanDimOp::create(rewriter, loc, reducedAccTy, input,
+                                            reduceDimList, cstTrue, none);
 
     // x - mean(x)
-    Value inputMeanExpanded = AtenExpandAsOp::create(rewriter, loc, inputTy,
-                                                     inputMean, op.getInput());
-    Value inputSubMean = AtenSubTensorOp::create(
-        rewriter, loc, inputTy, op.getInput(), inputMeanExpanded, one);
+    Value inputMeanExpanded =
+        AtenExpandAsOp::create(rewriter, loc, inputAccTy, inputMean, input);
+    Value inputSubMean = AtenSubTensorOp::create(rewriter, loc, inputAccTy,
+                                                 input, inputMeanExpanded, one);
     // (x - mean(x))^2
     Value inputSubMeanSquare = AtenMulTensorOp::create(
-        rewriter, loc, inputTy, inputSubMean, inputSubMean);
+        rewriter, loc, inputAccTy, inputSubMean, inputSubMean);
 
     Value variancesum = AtenSumDimIntListOp::create(
-        rewriter, loc, reducedTy, inputSubMeanSquare, reduceDimList, cstTrue,
+        rewriter, loc, reducedAccTy, inputSubMeanSquare, reduceDimList, cstTrue,
         /*dtype=*/none);
 
     int64_t elemCount = 1;
@@ -7892,26 +7929,21 @@ class DecomposeAtenInstanceNormOp
     Value hw = Torch::ConstantIntOp::create(
         rewriter, loc, rewriter.getI64IntegerAttr(elemCount));
     Value inputVar =
-        AtenDivScalarOp::create(rewriter, loc, reducedTy, variancesum, hw);
+        AtenDivScalarOp::create(rewriter, loc, reducedAccTy, variancesum, hw);
 
     // rsqrt(var(x) + eps)
-    Value inputVarPlusEps = AtenAddScalarOp::create(rewriter, loc, reducedTy,
+    Value inputVarPlusEps = AtenAddScalarOp::create(rewriter, loc, reducedAccTy,
                                                     inputVar, op.getEps(), one);
     Value inputRsqrtVar =
-        AtenRsqrtOp::create(rewriter, loc, reducedTy, inputVarPlusEps);
+        AtenRsqrtOp::create(rewriter, loc, reducedAccTy, inputVarPlusEps);
 
     // (x - mean(x)) * rsqrt(var(x) + eps)
-    Value inputRsqrtVarExpanded = AtenExpandAsOp::create(
-        rewriter, loc, inputTy, inputRsqrtVar, op.getInput());
+    Value inputRsqrtVarExpanded =
+        AtenExpandAsOp::create(rewriter, loc, inputAccTy, inputRsqrtVar, input);
     Value inputNormalized = AtenMulTensorOp::create(
-        rewriter, loc, inputTy, inputSubMean, inputRsqrtVarExpanded);
-    Value out = TensorStaticInfoCastOp::create(
-        rewriter, loc, op.getResult().getType(), inputNormalized);
+        rewriter, loc, inputAccTy, inputSubMean, inputRsqrtVarExpanded);
 
-    Value weight = op.getWeight();
     auto weightTy = cast<BaseTensorType>(weight.getType());
-    dtype = weightTy.getOptionalDtype();
-
     SmallVector<int64_t> weightShape(weightTy.getSizes());
     SmallVector<int64_t> newWeightShape;
     newWeightShape.push_back(1);
@@ -7920,32 +7952,29 @@ class DecomposeAtenInstanceNormOp
     Value zero = Torch::ConstantIntOp::create(rewriter, loc,
                                               rewriter.getI64IntegerAttr(0));
     Type newWeightTy = ValueTensorType::get(
-        op.getContext(), llvm::ArrayRef(newWeightShape), dtype);
+        op.getContext(), llvm::ArrayRef(newWeightShape), accDtype);
     weight = AtenUnsqueezeOp::create(rewriter, loc, newWeightTy, weight, zero);
 
     while (static_cast<int64_t>(newWeightShape.size()) < inputRank) {
       Value i = Torch::ConstantIntOp::create(
           rewriter, loc, rewriter.getI64IntegerAttr(newWeightShape.size()));
       newWeightShape.push_back(1);
-      newWeightTy = ValueTensorType::get(op.getContext(),
-                                         llvm::ArrayRef(newWeightShape), dtype);
+      newWeightTy = ValueTensorType::get(
+          op.getContext(), llvm::ArrayRef(newWeightShape), accDtype);
       weight = AtenUnsqueezeOp::create(rewriter, loc, newWeightTy, weight, i);
     }
 
     Value weightExpanded =
-        AtenExpandAsOp::create(rewriter, loc, inputTy, weight, op.getInput());
+        AtenExpandAsOp::create(rewriter, loc, inputAccTy, weight, input);
 
-    Value bias = op.getBias();
     auto biasTy = cast<BaseTensorType>(bias.getType());
-    dtype = biasTy.getOptionalDtype();
-
     SmallVector<int64_t> biasShape(biasTy.getSizes());
     SmallVector<int64_t> newBiasShape;
     newBiasShape.push_back(1);
     newBiasShape.append(biasShape);
 
-    Type newBiasTy = ValueTensorType::get(op.getContext(),
-                                          llvm::ArrayRef(newBiasShape), dtype);
+    Type newBiasTy = ValueTensorType::get(
+        op.getContext(), llvm::ArrayRef(newBiasShape), accDtype);
     bias = AtenUnsqueezeOp::create(rewriter, loc, newBiasTy, bias, zero);
 
     while (static_cast<int64_t>(newBiasShape.size()) < inputRank) {
@@ -7953,17 +7982,22 @@ class DecomposeAtenInstanceNormOp
           rewriter, loc, rewriter.getI64IntegerAttr(newBiasShape.size()));
       newBiasShape.push_back(1);
       newBiasTy = ValueTensorType::get(op.getContext(),
-                                       llvm::ArrayRef(newBiasShape), dtype);
+                                       llvm::ArrayRef(newBiasShape), accDtype);
       bias = AtenUnsqueezeOp::create(rewriter, loc, newBiasTy, bias, i);
     }
 
     Value biasExpanded =
-        AtenExpandAsOp::create(rewriter, loc, inputTy, bias, op.getInput());
+        AtenExpandAsOp::create(rewriter, loc, inputAccTy, bias, input);
 
-    out = AtenMulTensorOp::create(rewriter, loc, out.getType(), out,
-                                  weightExpanded);
-    out = AtenAddTensorOp::create(rewriter, loc, out.getType(), out,
-                                  biasExpanded, one);
+    Value out = AtenMulTensorOp::create(rewriter, loc, inputAccTy,
+                                        inputNormalized, weightExpanded);
+    out = AtenAddTensorOp::create(rewriter, loc, inputAccTy, out, biasExpanded,
+                                  one);
+
+    if (origDtype != accDtype)
+      out = convertTensorToDtype(rewriter, loc, out, origDtype);
+    out = TensorStaticInfoCastOp::create(rewriter, loc,
+                                         op.getResult().getType(), out);
 
     rewriter.replaceOp(op, out);
     return success();
@@ -11639,7 +11673,7 @@ namespace {
 Value getDFTMatmulCoeff(PatternRewriter &rewriter, Location loc,
                         ValueTensorType matrixType) {
   // scale = 2 * pi / N
-  double scale = 2 * M_PI / matrixType.getSizes()[0];
+  double scale = 2 * llvm::numbers::pi / matrixType.getSizes()[0];
 
   SmallVector<Attribute> values;
   assert(matrixType.getSizes().size() == 2 && "expected 2D matrix");

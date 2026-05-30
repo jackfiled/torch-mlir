@@ -30,6 +30,8 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/MathExtras.h"
+#include <array>
 #include <cmath>
 #include <numeric>
 #include <optional>
@@ -4266,12 +4268,12 @@ LogicalResult ConvertAtenOp<AtenGeluOp>::matchAndRewriteImpl(
                                     selfShape, selfElemTy)
             .value();
 
-    // From <cmath> header: M_2_PI = 2 / pi
     Value twoOverPi =
         tosa::getConstTensor<float>(
             rewriter, op,
-            SmallVector<float>(numElem, static_cast<float>(M_2_PI)), selfShape,
-            selfElemTy)
+            SmallVector<float>(numElem,
+                               static_cast<float>(2.0 / llvm::numbers::pi)),
+            selfShape, selfElemTy)
             .value();
 
     // 0.5 * x
@@ -5999,10 +6001,25 @@ LogicalResult ConvertAtenOp<AtenClampOp>::matchAndRewriteImpl(
   if (!selfType)
     return rewriter.notifyMatchFailure(
         op, "only tensor types input are currently supported");
+  auto selfTorchType = dyn_cast<Torch::BaseTensorType>(op.getSelf().getType());
+  if (selfTorchType && selfTorchType.getDtype().isUnsignedInteger()) {
+    return rewriter.notifyMatchFailure(
+        op, "unsigned integer clamp is not currently supported");
+  }
 
   auto outType =
       dyn_cast<TensorType>(getTypeConverter()->convertType(op.getType()));
+  if (!outType)
+    return rewriter.notifyMatchFailure(
+        op, "only tensor types output are currently supported");
   auto outElemTy = outType.getElementType();
+  Value self = adaptor.getSelf();
+  if (selfType != outType) {
+    auto castedSelf = tosa::tosaCastTensorToType(rewriter, self, outType);
+    if (!castedSelf)
+      return rewriter.notifyMatchFailure(op, "failed to cast self");
+    self = *castedSelf;
+  }
 
   std::optional<int64_t> minInt;
   std::optional<double> minFloat;
@@ -6046,7 +6063,7 @@ LogicalResult ConvertAtenOp<AtenClampOp>::matchAndRewriteImpl(
     }
 
     rewriter.replaceOpWithNewOp<tosa::ClampOp>(
-        op, outType, adaptor.getSelf(), minIntAttr, maxIntAttr,
+        op, outType, self, minIntAttr, maxIntAttr,
         /*nan_mode=*/
         tosa::NanPropagationModeAttr::get(rewriter.getContext(),
                                           tosa::NanPropagationMode::PROPAGATE));
@@ -6059,7 +6076,7 @@ LogicalResult ConvertAtenOp<AtenClampOp>::matchAndRewriteImpl(
     }
 
     rewriter.replaceOpWithNewOp<tosa::ClampOp>(
-        op, outType, adaptor.getSelf(), minFloatAttr, maxFloatAttr,
+        op, outType, self, minFloatAttr, maxFloatAttr,
         /*nan_mode=*/
         tosa::NanPropagationModeAttr::get(rewriter.getContext(),
                                           tosa::NanPropagationMode::PROPAGATE));
@@ -7090,6 +7107,24 @@ static LogicalResult getOutputTypeAndPoolingParameters(
     strideInts.assign(kernelSizeInts);
   } else {
     expandPoolParams(op, strideInts, 1);
+  }
+
+  // The ONNX-to-Torch importer encodes dilation into the trailing half of the
+  // `stride` arg (DefaultDomainAtoF.cpp `AveragePool` legalization). TOSA
+  // pooling has no dilation, so strip the encoded tail when it is all 1s and
+  // bail otherwise.
+  if constexpr (std::is_same<AtenOpT, AtenAvgPool1dOp>() ||
+                std::is_same<AtenOpT, AtenAvgPool2dOp>()) {
+    const size_t expectedRank = kernelSizeInts.size();
+    if (strideInts.size() == 2 * expectedRank) {
+      ArrayRef<int64_t> encodedDilation =
+          ArrayRef<int64_t>(strideInts).drop_front(expectedRank);
+      if (!llvm::all_of(encodedDilation, [](int64_t d) { return d == 1; }))
+        return rewriter.notifyMatchFailure(
+            op, "Non-unit dilation encoded in stride is unsupported for TOSA "
+                "pooling lowering");
+      strideInts.truncate(expectedRank);
+    }
   }
 
   if (!matchPattern(op.getPadding(), m_TorchListOfConstantInts(paddingInts)))
@@ -9748,6 +9783,200 @@ LogicalResult ConvertAtenOp<AtenExpm1Op>::matchAndRewriteImpl(
   return success();
 }
 
+// Legalization for aten.atan
+// NOTE: TOSA has no native atan op, so this lowering is approximate.
+template <>
+LogicalResult ConvertAtenOp<AtenAtanOp>::matchAndRewriteImpl(
+    AtenAtanOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  // Approximate atan using only TOSA-supported elementwise ops.
+  // This lowering evaluates the approximation in f32 because the tables below
+  // were characterized in that precision. F16/BF16 results are cast back after
+  // the approximation:
+  //   1. Use odd symmetry to work on |x| and restore the sign at the end:
+  //      atan(x) = sign(x) * atan(|x|)
+  //   2. Reduce the approximation domain to [0, 1]:
+  //      atan(x) = pi/2 - atan(1/x), for x > 1
+  //   3. On the reduced domain, evaluate a three-piece odd polynomial
+  //      selected by two comparisons. The three-piece fit is tighter on
+  //      [0, 1] than a single global polynomial.
+  //   4. For |x| > 1, map atan(1/|x|) back to atan(|x|) using pi/2 - y.
+  //   5. Restore the sign to recover atan(x).
+
+  // Offline-generated piecewise least-squares polynomial fit for the reduced
+  // domain [0, 1]. The split points were grid-searched, each interval was fit
+  // with an odd degree-9 polynomial x * Q(x^2), and the final float32-rounded
+  // tables were selected to minimize the max absolute error over the evaluated
+  // grid. The resulting max absolute error over [0, 1] is about 1.68e-7 for the
+  // f32-rounded approximation.
+  static constexpr float kAtanPieceSplit0 = 0.545f;
+  static constexpr float kAtanPieceSplit1 = 0.790f;
+  static constexpr float kHalfPi = static_cast<float>(llvm::numbers::pi / 2.0);
+  static constexpr std::array<float, 5> kAtanLowCoefficients = {
+      0.99999911f, -0.33326823f, 0.19863147f, -0.13088399f, 0.06237525f};
+  static constexpr std::array<float, 5> kAtanMidCoefficients = {
+      0.99967003f, -0.32927018f, 0.17950013f, -0.08775605f, 0.02366923f};
+  static constexpr std::array<float, 5> kAtanHighCoefficients = {
+      0.99759096f, -0.31623319f, 0.14831167f, -0.05400498f, 0.00973381f};
+
+  auto self = adaptor.getSelf();
+  auto selfType = dyn_cast<RankedTensorType>(self.getType());
+  auto resultType =
+      dyn_cast<RankedTensorType>(typeConverter->convertType(op.getType()));
+  if (!selfType || !resultType)
+    return rewriter.notifyMatchFailure(
+        op, "Only ranked tensor types are supported");
+
+  Type resultElemTy = resultType.getElementType();
+  if (!resultElemTy.isF32() && !resultElemTy.isF16() && !resultElemTy.isBF16())
+    return rewriter.notifyMatchFailure(
+        op, "Only f32, f16 and bf16 result types are currently supported");
+
+  RankedTensorType computeType = resultType;
+  if (!resultElemTy.isF32())
+    computeType =
+        RankedTensorType::get(resultType.getShape(), rewriter.getF32Type());
+
+  if (self.getType() != computeType) {
+    auto castedSelf = tosa::tosaCastTensorToType(rewriter, self, computeType);
+    if (!castedSelf)
+      return rewriter.notifyMatchFailure(
+          op, "Failed to cast input to approximation type");
+    self = *castedSelf;
+  }
+
+  // Evaluate P(x) = x * Q(x^2) by running Horner's method on Q using
+  // the precomputed `xSquared`, then multiplying by x.
+  auto emitPolynomialFromSquared =
+      [&](Value x, Value xSquared,
+          ArrayRef<float> coefficients) -> FailureOr<Value> {
+    auto xTy = dyn_cast<RankedTensorType>(x.getType());
+    auto xSquaredTy = dyn_cast<RankedTensorType>(xSquared.getType());
+    if (!xTy || !xSquaredTy || !isa<FloatType>(xTy.getElementType()) ||
+        xTy != xSquaredTy || coefficients.empty())
+      return failure();
+
+    FailureOr<Value> accOr = tosa::getBroadcastableConstTensorSingleF32(
+        rewriter, op, x, coefficients.back());
+    if (failed(accOr))
+      return failure();
+    Value acc = *accOr;
+
+    for (int64_t i = static_cast<int64_t>(coefficients.size()) - 2; i >= 0;
+         --i) {
+      acc = tosa::createMulOpAndCast(rewriter, op, xTy, acc, xSquared,
+                                     /*shift=*/0);
+      FailureOr<Value> coeffOr = tosa::getBroadcastableConstTensorSingleF32(
+          rewriter, op, x, coefficients[i]);
+      if (failed(coeffOr))
+        return failure();
+      acc = tosa::AddOp::create(rewriter, op->getLoc(), xTy, acc, *coeffOr);
+    }
+
+    return tosa::createMulOpAndCast(rewriter, op, xTy, x, acc,
+                                    /*shift=*/0)
+        .getResult();
+  };
+
+  FailureOr<Value> zeroOr =
+      tosa::getBroadcastableConstTensorSingleF32(rewriter, op, self, 0.0f);
+  FailureOr<Value> oneOr =
+      tosa::getBroadcastableConstTensorSingleF32(rewriter, op, self, 1.0f);
+  FailureOr<Value> split0Or = tosa::getBroadcastableConstTensorSingleF32(
+      rewriter, op, self, kAtanPieceSplit0);
+  FailureOr<Value> split1Or = tosa::getBroadcastableConstTensorSingleF32(
+      rewriter, op, self, kAtanPieceSplit1);
+  FailureOr<Value> piOverTwoOr =
+      tosa::getBroadcastableConstTensorSingleF32(rewriter, op, self, kHalfPi);
+  if (failed(zeroOr) || failed(oneOr) || failed(split0Or) || failed(split1Or) ||
+      failed(piOverTwoOr))
+    return rewriter.notifyMatchFailure(
+        op, "Failed to materialize broadcastable constants");
+
+  Value zero = *zeroOr;
+  Value one = *oneOr;
+  Value split0 = *split0Or;
+  Value split1 = *split1Or;
+  Value piOverTwo = *piOverTwoOr;
+  auto boolType =
+      RankedTensorType::get(computeType.getShape(), rewriter.getIntegerType(1));
+
+  // Step 1. Work with the magnitude and remember which values need reflection.
+  Value absSelf =
+      tosa::AbsOp::create(rewriter, op->getLoc(), computeType, self);
+  Value gtOne =
+      tosa::GreaterOp::create(rewriter, op->getLoc(), boolType, absSelf, one);
+
+  // Step 2. Reduce the approximation input to [0, 1]. Only inputs in the
+  // |x| > 1 region need a reciprocal, so feed the reciprocal op with `1`
+  // elsewhere and avoid evaluating reciprocal(0).
+  Value reciprocalInput = tosa::SelectOp::create(
+      rewriter, op->getLoc(), computeType, gtOne, absSelf, one);
+  Value reciprocalAbsSelf = tosa::ReciprocalOp::create(
+      rewriter, op->getLoc(), computeType, reciprocalInput);
+  Value reducedInput = tosa::SelectOp::create(
+      rewriter, op->getLoc(), computeType, gtOne, reciprocalAbsSelf, absSelf);
+  Value gtSplit0 = tosa::GreaterOp::create(rewriter, op->getLoc(), boolType,
+                                           reducedInput, split0);
+  Value gtSplit1 = tosa::GreaterOp::create(rewriter, op->getLoc(), boolType,
+                                           reducedInput, split1);
+
+  // Step 3. Evaluate the three polynomial pieces on the reduced input and
+  // select the interval-specific approximation.
+  Value reducedInputSquared = tosa::createMulOpAndCast(
+      rewriter, op, computeType, reducedInput, reducedInput, /*shift=*/0);
+  FailureOr<Value> lowApproxOr = emitPolynomialFromSquared(
+      reducedInput, reducedInputSquared, ArrayRef<float>(kAtanLowCoefficients));
+  FailureOr<Value> midApproxOr = emitPolynomialFromSquared(
+      reducedInput, reducedInputSquared, ArrayRef<float>(kAtanMidCoefficients));
+  FailureOr<Value> highApproxOr =
+      emitPolynomialFromSquared(reducedInput, reducedInputSquared,
+                                ArrayRef<float>(kAtanHighCoefficients));
+  if (failed(lowApproxOr) || failed(midApproxOr) || failed(highApproxOr))
+    return rewriter.notifyMatchFailure(
+        op, "Failed to evaluate atan polynomial approximation");
+
+  Value reducedApprox =
+      tosa::SelectOp::create(rewriter, op->getLoc(), computeType, gtSplit0,
+                             *midApproxOr, *lowApproxOr);
+  reducedApprox =
+      tosa::SelectOp::create(rewriter, op->getLoc(), computeType, gtSplit1,
+                             *highApproxOr, reducedApprox);
+
+  // Step 4. For |x| > 1, map atan(1/|x|) back to atan(|x|) using pi/2 - y.
+  Value reflectedApprox = tosa::SubOp::create(
+      rewriter, op->getLoc(), computeType, piOverTwo, reducedApprox);
+  Value magnitude =
+      tosa::SelectOp::create(rewriter, op->getLoc(), computeType, gtOne,
+                             reflectedApprox, reducedApprox);
+
+  // Step 5. Restore the original sign.
+  Value isNonNegative = tosa::GreaterEqualOp::create(rewriter, op->getLoc(),
+                                                     boolType, self, zero);
+  Value negMagnitude =
+      tosa::SubOp::create(rewriter, op->getLoc(), computeType, zero, magnitude);
+
+  Value signedMagnitude =
+      tosa::SelectOp::create(rewriter, op->getLoc(), computeType, isNonNegative,
+                             magnitude, negMagnitude);
+  Value isZero =
+      tosa::EqualOp::create(rewriter, op->getLoc(), boolType, self, zero);
+
+  Value result = tosa::SelectOp::create(rewriter, op->getLoc(), computeType,
+                                        isZero, self, signedMagnitude);
+  if (computeType != resultType) {
+    auto castedResult =
+        tosa::tosaCastTensorToType(rewriter, result, resultType);
+    if (!castedResult)
+      return rewriter.notifyMatchFailure(
+          op, "Failed to cast approximation to result type");
+    result = *castedResult;
+  }
+
+  rewriter.replaceOp(op, result);
+  return success();
+}
+
 // Legalization for aten.tan
 template <>
 LogicalResult ConvertAtenOp<AtenTanOp>::matchAndRewriteImpl(
@@ -10750,6 +10979,7 @@ std::set<StringRef> populateTorchToTosaConversionPatternsAndIllegalOps(
   INSERT_ATENOP_PATTERN(AtenLog1pOp);
   INSERT_ATENOP_PATTERN(AtenLog10Op);
   INSERT_ATENOP_PATTERN(AtenExpm1Op);
+  INSERT_ATENOP_PATTERN(AtenAtanOp);
   INSERT_ATENOP_PATTERN(AtenTanOp);
   INSERT_ATENOP_PATTERN(AtenUnfoldOp);
   INSERT_ATENOP_PATTERN(AtenCumsumOp);
